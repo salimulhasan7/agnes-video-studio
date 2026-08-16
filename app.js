@@ -496,11 +496,20 @@ function pollUntilDone(scene, el) {
         const status = d.status || '';
         const progress = d.progress != null ? d.progress : (attempts * 5);
 
-        if (status === 'completed' || d.metadata && d.metadata.url) {
-          scene.videoUrl = d.metadata.url;
-          scene.seconds = d.seconds ? String(parseFloat(d.seconds).toFixed(1)) : scene.seconds;
-          setSceneStatus(scene, el, 'completed', 100);
-          return resolve(d);
+        if (status === 'completed') {
+          // safety: completed must carry a usable download URL; otherwise keep polling (not done yet)
+          if (d.metadata && d.metadata.url) {
+            scene.videoUrl = d.metadata.url;
+            scene.seconds = d.seconds ? String(parseFloat(d.seconds).toFixed(1)) : scene.seconds;
+            setSceneStatus(scene, el, 'completed', 100);
+            return resolve(d);
+          }
+          // completed but no URL yet — treat as still processing, keep waiting
+          const p = Math.min(99, Math.max(0, progress));
+          setSceneStatus(scene, el, 'progress', p);
+          await sleep(10000);
+          tick();
+          return;
         }
         if (status === 'failed') {
           const em = (d.error && (d.error.message || d.error.code)) || 'Generation failed';
