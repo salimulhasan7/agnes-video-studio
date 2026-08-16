@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agnes Video Studio — দীর্ঘ ভিডিও তৈরির টুল</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-logo">🎬</span>
+      <div>
+        <h1>Agnes Video Studio</h1>
+        <p>দীর্ঘ ফরম্যাট ভিডিও বানান — Agnes AI API দিয়ে | Long-format video maker</p>
+      </div>
+    </div>
+    <div class="brand-status">
+      <span id="keyBadge" class="badge badge-off">No API key</span>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- ============ SETTINGS ============ -->
+  <section class="card" id="settingsCard">
+    <div class="card-head">
+      <h2>🔑 API Settings</h2>
+      <p>আপনার Agnes AI API key দিন (এটি শুধু আপনার ব্রাউজারেই থাকবে, কোথাও আপলোড হয় না)।</p>
+    </div>
+    <div class="field-row">
+      <input type="password" id="apiKey" placeholder="sk-xxxxxxxxxxxxxxxx" autocomplete="off">
+      <button class="btn btn-primary" id="btnTestKey">Test key</button>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="projectTitle">Project title (ঐচ্ছিক)</label>
+        <input type="text" id="projectTitle" placeholder="My long video">
+      </div>
+    </div>
+    <p class="hint">API key ব্রাউজার localStorage-এ সংরক্ষিত হয়। GitHub Pages-এ হোস্ট করলেও key কখনো প্রকাশ হবে না।</p>
+  </section>
+
+  <!-- ============ STORY ============ -->
+  <section class="card" id="storyCard">
+    <div class="card-head">
+      <h2>📝 Story / Script</h2>
+      <p>আপনার গল্প লিখুন (বাংলা বা ইংরেজি), AI সেটিকে scene-এ ভাগ করবে।</p>
+    </div>
+    <textarea id="storyInput" rows="6" placeholder="যেমন: একটি কিশোরের স্বপ্ন — সে একদিন মহাকাশে যেতে চায়। গল্প শুরু হয় গ্রামের মাঠে..."></textarea>
+    <div class="field-row wrap">
+      <div class="field">
+        <label for="sceneCount">Scene সংখ্যা</label>
+        <input type="number" id="sceneCount" min="2" max="12" value="5">
+      </div>
+      <div class="field">
+        <label for="sceneDuration">প্রতি scene-এর সময় (সেকেন্ড)</label>
+        <select id="sceneDuration">
+          <option value="3">~3 sec</option>
+          <option value="5" selected>~5 sec</option>
+          <option value="10">~10 sec</option>
+          <option value="18">~18 sec (max)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="aspectRatio">অ্যাসপেক্ট রেশিও</label>
+        <select id="aspectRatio">
+          <option value="16:9">16:9 (YouTube)</option>
+          <option value="9:16">9:16 (Reels/TikTok)</option>
+          <option value="1:1">1:1 (Square)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="videoStyle">স্টাইল / style</label>
+        <input type="text" id="videoStyle" placeholder="cinematic, realistic, anime...">
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-accent" id="btnGenStoryboard">✨ AI দিয়ে Storyboard বানান</button>
+      <button class="btn btn-ghost" id="btnAddScene">+ Add empty scene</button>
+    </div>
+    <div id="storyError" class="error-box hidden"></div>
+  </section>
+
+  <!-- ============ SCENES ============ -->
+  <section class="card" id="scenesCard">
+    <div class="card-head">
+      <h2>🎞️ Scene Timeline</h2>
+      <p>প্রতিটি scene আলাদা video clip। পরের clip আগের clip-এর শেষ ফ্রেম থেকে <b>extend</b> হয় (Grok-এর মতো)।</p>
+    </div>
+    <div id="sceneList" class="scene-list"></div>
+    <div class="btn-row" id="pipelineBar">
+      <button class="btn btn-success" id="btnGenerateAll">▶ Generate full video (sequentially)</button>
+      <button class="btn btn-ghost" id="btnClearAll">Clear all segments</button>
+      <span id="pipelineStatus" class="pipeline-status"></span>
+    </div>
+  </section>
+
+  <!-- ============ PLAYER ============ -->
+  <section class="card" id="playerCard">
+    <div class="card-head">
+      <h2>📺 Preview — Full Long Video</h2>
+      <p>সব scene একসাথে দেখুন (সিকোয়েন্সিয়াল প্লেব্যাক)।</p>
+    </div>
+    <div class="player-box">
+      <video id="fullPlayer" controls playsinline></video>
+      <div class="player-overlay" id="playerOverlay">No video yet — generate scenes first</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btnPlayFull">▶ Play full video</button>
+      <button class="btn btn-ghost" id="btnStopFull">⏹ Stop</button>
+      <span id="totalLength" class="pipeline-status"></span>
+    </div>
+  </section>
+
+  <!-- ============ VOICEOVER ============ -->
+  <section class="card" id="voiceCard">
+    <div class="card-head">
+      <h2>🗣️ Bangla Voiceover</h2>
+      <p>প্রতি scene-এর জন্য বাংলা narration টেক্সট তৈরি হয়। গুগল TTS দিয়ে শুনুন / ডাউনলোড করুন, কিংবা ব্রাউজারের বাংলা ভয়েস দিয়ে শুনুন।</p>
+    </div>
+    <div id="voiceList" class="voice-list"></div>
+  </section>
+
+  <footer class="foot">
+    <p>Powered by <a href="https://agnes-ai.com" target="_blank" rel="noopener">Agnes AI</a> API (agnes-video-v2.0 · agnes-image-2.1-flash · agnes-2.5-flash). Static site — deploy on GitHub Pages.</p>
+  </footer>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
