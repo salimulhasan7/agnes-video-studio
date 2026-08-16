@@ -151,8 +151,9 @@ async function generateImage(prompt, ratio) {
       }),
     })), 'image')
     .then(data => {
-      if (!data.data || !data.data[0] || !data.data[0].url) throw new Error('Image API returned no URL');
-      return data.data[0].url;
+      const url = data && data.data && data.data[0] && data.data[0].url;
+      if (!url) throw new Error('Image API returned no URL');
+      return url;
     });
 }
 
@@ -178,7 +179,8 @@ async function pollVideo(videoId) {
     err.status = res.status;
     throw err;
   }
-  return data;
+  if (data && typeof data === 'object') return data;
+  throw new Error('Video status query returned an invalid response');
 }
 
 /* upload a dataURL (last frame) to a public, CORS-friendly host */
@@ -188,9 +190,10 @@ async function uploadFrame(dataUrl) {
   fd.append('file', blob, 'frame.png');
   const res = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd });
   const j = await res.json();
-  if (j.status !== 'success' || !j.data || !j.data.url) throw new Error('Frame upload failed');
+  const url = j && j.data && j.data.url;
+  if (j && j.status !== 'success' || !url) throw new Error('Frame upload failed');
   // convert to raw file URL for direct fetching
-  return j.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+  return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
 }
 
 /* extract the last frame of a video as a PNG dataURL (Grok-style extend) */
