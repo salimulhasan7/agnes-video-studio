@@ -509,7 +509,7 @@ function pollUntilDone(scene, el) {
 
         const p = Math.min(99, Math.max(0, progress));
         setSceneStatus(scene, el, 'progress', p);
-        await sleep(4000);
+        await sleep(10000);
         tick();
       } catch (e) {
         const rl = parseRateLimit(e);
@@ -523,7 +523,7 @@ function pollUntilDone(scene, el) {
           } else return reject(e);
         } else if (attempts < 5) {
           // transient network errors: retry a few times
-          await sleep(4000); tick();
+          await sleep(10000); tick();
         } else return reject(e);
       }
     };
@@ -572,16 +572,23 @@ $('#btnGenerateAll').addEventListener('click', async () => {
       : `Waiting ${secs}s (${what} rate limit)…`;
   };
 
-  for (const scene of state.scenes) {
-    if (scene.status === 'completed') continue;
+  const scenesToRun = state.scenes.filter(s => s.status !== 'completed');
+  for (let i = 0; i < scenesToRun.length; i++) {
+    const scene = scenesToRun[i];
     const el = $(`.scene[data-id="${scene.id}"]`);
-    status.textContent = `Generating scene ${sceneIndex(scene) + 1}/${state.scenes.length}…`;
+    const num = sceneIndex(scene) + 1;
+    status.textContent = `Scene ${num}/${state.scenes.length}: generating… (একটি করে, ধীরে ধীরে)`;
     // refresh prompt from textarea
     if (el) scene.videoPrompt = el.querySelector('.scene-prompt').value;
     try {
       await generateOneScene(scene, el, true);
     } catch (e) {
       // per-scene errors are already surfaced; continue with next scene
+    }
+    // 5s pause between scenes — as per the requested pacing
+    if (i < scenesToRun.length - 1) {
+      status.textContent = `Scene ${num}/${state.scenes.length} done — pausing 5s before next scene…`;
+      await sleep(5000);
     }
   }
 
