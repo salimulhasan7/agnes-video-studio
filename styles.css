@@ -48,6 +48,7 @@ body {
 }
 .badge-off { color: var(--muted); background: var(--card2); }
 .badge-on { color: #fff; background: var(--green); border-color: var(--green); }
+.badge-version { color: var(--cyan); background: transparent; font-family: ui-monospace, monospace; font-size: 11px; }
 
 .container { max-width: 1080px; margin: 0 auto; padding: 24px 20px 60px; }
 

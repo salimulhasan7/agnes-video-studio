@@ -10,6 +10,13 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
+const APP_VERSION = '20260816c';
+
+/* Global error guard: never let an uncaught error kill the page silently.
+ * Shows a dismissible overlay with the exact message so cache issues are visible. */
+window.addEventListener('error', (e) => {
+  try { toast('Error: ' + (e.message || 'unknown') + ' — if old error persists, hard refresh (Ctrl+Shift+R)', true); } catch (_) {}
+});
 
 const RATIO_SIZES = {
   '16:9': { width: 1152, height: 768 },
@@ -773,6 +780,11 @@ function updateKeyBadge(valid) {
   else { b.textContent = 'No API key'; b.className = 'badge badge-off'; }
 }
 
+function updateVersionBadge() {
+  const b = $('#verBadge');
+  if (b) { b.textContent = 'v' + APP_VERSION; b.title = 'app build ' + APP_VERSION; }
+}
+
 /* ---------- utils ---------- */
 function uid() { return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -782,6 +794,7 @@ function escapeHtml(s) {
 function escapeAttr(s) { return escapeHtml(s).replace(/'/g, '&#39;'); }
 
 /* ---------- init ---------- */
+updateVersionBadge();
 loadState();
 if (state.apiKey) { $('#apiKey').value = state.apiKey; updateKeyBadge(true); }
 if (state.projectTitle) $('#projectTitle').value = state.projectTitle;
