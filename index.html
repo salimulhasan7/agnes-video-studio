@@ -79,6 +79,18 @@
         <input type="text" id="videoStyle" placeholder="cinematic, realistic, anime...">
       </div>
     </div>
+    <div class="field-row wrap">
+      <div class="field">
+        <label for="videoRpm">Video requests per minute</label>
+        <select id="videoRpm">
+          <option value="1" selected>1 / min (free)</option>
+          <option value="2">2 / min</option>
+          <option value="5">5 / min (token plan)</option>
+          <option value="10">10 / min</option>
+        </select>
+      </div>
+      <p class="hint">Agnes API-র rate limit মেনে টুল প্রতিটি video request-এর মাঝে স্বয়ংক্রিয়ভাবে অপেক্ষা করে। একাউন্টের সীমা অনুযায়ী নির্বাচন করুন।</p>
+    </div>
     <div class="btn-row">
       <button class="btn btn-accent" id="btnGenStoryboard">✨ AI দিয়ে Storyboard বানান</button>
       <button class="btn btn-ghost" id="btnAddScene">+ Add empty scene</button>

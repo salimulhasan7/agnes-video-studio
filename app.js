@@ -23,12 +23,75 @@ const FRAME_RATE = 24;
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+/* ---------- rate limiting ----------
+ * Agnes enforces RPM per account. Video on the free tier is 1 req/min.
+ * We throttle creation client-side AND auto-retry after a 429.
+ * A callback lets the pipeline show a live countdown to the user.
+ */
+const VIDEO_RPM_OPTIONS = { 1: 62000, 2: 32000, 5: 15000, 10: 9000 };
+const MIN_INTERVALS = {
+  video: () => VIDEO_RPM_OPTIONS[state.settings.videoRpm || 1] || 62000,
+  image: () => 3200,   // image ~20 rpm → 3.2s spacing
+  chat:  () => 3200,   // chat ~20 rpm
+  poll:  () => 0,
+};
+const lastCallAt = {};
+let onRateWait = null; // (remainingSeconds, kind) => void
+
+function videoRpmInterval() { return MIN_INTERVALS.video(); }
+
+async function throttle(kind) {
+  const interval = MIN_INTERVALS[kind] ? MIN_INTERVALS[kind]() : 0;
+  if (!interval) return;
+  const since = lastCallAt[kind] || 0;
+  const wait = since + interval - Date.now();
+  if (wait > 0) {
+    const secs = Math.ceil(wait / 1000);
+    if (onRateWait) onRateWait(secs, kind);
+    else toast(`Rate limit: waiting ${secs}s before next ${kind} request…`, true);
+    await sleep(secs * 1000);
+  }
+  lastCallAt[kind] = Date.now();
+}
+
+/* Try to parse a rate-limit error message like:
+ * "video generation rate limit exceeded: allows 1 requests per 1 minute(s) (request id: ...)"
+ * Returns { perMinutes } on success, null otherwise.
+ */
+function parseRateLimit(err) {
+  if (!err) return null;
+  const msg = String(err.message || '');
+  const m = msg.match(/allows\s+\d+\s+requests?\s+per\s+(\d+)\s+minute/i);
+  if (m) return { perMinutes: parseInt(m[1], 10) || 1 };
+  if (err.status === 429) return { perMinutes: 1 };
+  if (/rate limit/i.test(msg)) return { perMinutes: 1 };
+  return null;
+}
+
+async function retryOnRateLimit(fn, kind) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      const rl = parseRateLimit(err);
+      if (!rl) throw err;
+      if (attempt >= 3) throw err;
+      attempt++;
+      const waitMs = rl.perMinutes * 60000;
+      const secs = Math.ceil(waitMs / 1000);
+      if (onRateWait) onRateWait(secs, kind, true);
+      await sleep(secs * 1000);
+    }
+  }
+}
+
 /* ---------- state ---------- */
 let state = {
   apiKey: '',
   projectTitle: '',
   scenes: [],
-  settings: { sceneCount: 5, sceneDuration: 5, aspectRatio: '16:9', videoStyle: '' },
+  settings: { sceneCount: 5, sceneDuration: 5, aspectRatio: '16:9', videoStyle: '', videoRpm: 1 },
 };
 
 function loadState() {
@@ -63,35 +126,42 @@ async function apiFetch(path, opts) {
   if (!res.ok) {
     const msg = (data && data.error && (data.error.message || data.error.code))
       || ('HTTP ' + res.status);
-    throw new Error(String(msg));
+    const err = new Error(String(msg));
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
 
 async function chat(messages) {
-  return apiFetch('/v1/chat/completions', {
-    method: 'POST', headers: authHeaders(),
-    body: JSON.stringify({ model: CHAT_MODEL, messages, temperature: 0.6, max_tokens: 4000 }),
-  });
+  return retryOnRateLimit(() => throttle('chat')
+    .then(() => apiFetch('/v1/chat/completions', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ model: CHAT_MODEL, messages, temperature: 0.6, max_tokens: 4000 }),
+    })), 'chat');
 }
 
 async function generateImage(prompt, ratio) {
-  const data = await apiFetch('/v1/images/generations', {
-    method: 'POST', headers: authHeaders(),
-    body: JSON.stringify({
-      model: IMAGE_MODEL, prompt, size: '1K', ratio,
-      extra_body: { response_format: 'url' },
-    }),
-  });
-  if (!data.data || !data.data[0] || !data.data[0].url) throw new Error('Image API returned no URL');
-  return data.data[0].url;
+  return retryOnRateLimit(() => throttle('image')
+    .then(() => apiFetch('/v1/images/generations', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({
+        model: IMAGE_MODEL, prompt, size: '1K', ratio,
+        extra_body: { response_format: 'url' },
+      }),
+    })), 'image')
+    .then(data => {
+      if (!data.data || !data.data[0] || !data.data[0].url) throw new Error('Image API returned no URL');
+      return data.data[0].url;
+    });
 }
 
 async function createVideoTask(params) {
-  const data = await apiFetch('/v1/videos', {
-    method: 'POST', headers: authHeaders(),
-    body: JSON.stringify(Object.assign({ model: VIDEO_MODEL }, params)),
-  });
+  const data = await retryOnRateLimit(() => throttle('video')
+    .then(() => apiFetch('/v1/videos', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify(Object.assign({ model: VIDEO_MODEL }, params)),
+    })), 'video');
   const videoId = data.video_id || data.task_id || data.id;
   if (!videoId) throw new Error('Video task creation failed: no id returned');
   return { videoId, taskId: data.task_id || data.id, data };
@@ -104,7 +174,9 @@ async function pollVideo(videoId) {
   let data = null;
   try { data = await res.json(); } catch (e) {}
   if (!res.ok) {
-    throw new Error((data && data.error && (data.error.message || data.error.code)) || ('HTTP ' + res.status));
+    const err = new Error((data && data.error && (data.error.message || data.error.code)) || ('HTTP ' + res.status));
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -440,9 +512,19 @@ function pollUntilDone(scene, el) {
         await sleep(4000);
         tick();
       } catch (e) {
-        // transient network errors: retry a few times
-        if (attempts < 5) { await sleep(4000); tick(); }
-        else return reject(e);
+        const rl = parseRateLimit(e);
+        if (rl) {
+          // poll got rate-limited; wait out the window and resume polling
+          if (attempts < 20) {
+            const waitMs = rl.perMinutes * 60000;
+            if (onRateWait) onRateWait(Math.ceil(waitMs / 1000), 'poll', true);
+            await sleep(waitMs);
+            tick();
+          } else return reject(e);
+        } else if (attempts < 5) {
+          // transient network errors: retry a few times
+          await sleep(4000); tick();
+        } else return reject(e);
       }
     };
     tick();
@@ -483,6 +565,12 @@ $('#btnGenerateAll').addEventListener('click', async () => {
   $('#btnGenerateAll').disabled = true;
   $('#btnGenerateAll').textContent = '⏳ Generating…';
   const status = $('#pipelineStatus');
+  onRateWait = (secs, kind, retried) => {
+    const what = kind === 'video' ? 'video' : kind === 'image' ? 'image' : 'API';
+    status.textContent = retried
+      ? `Rate limit hit — waiting ${secs}s before retrying ${what}…`
+      : `Waiting ${secs}s (${what} rate limit)…`;
+  };
 
   for (const scene of state.scenes) {
     if (scene.status === 'completed') continue;
@@ -501,6 +589,7 @@ $('#btnGenerateAll').addEventListener('click', async () => {
   pipelineRunning = false;
   $('#btnGenerateAll').disabled = false;
   $('#btnGenerateAll').textContent = '▶ Generate full video (sequentially)';
+  onRateWait = null;
   updatePlayer();
   toast('Pipeline finished');
 });
@@ -657,6 +746,7 @@ $('#sceneCount').addEventListener('change', () => { state.settings.sceneCount = 
 $('#sceneDuration').addEventListener('change', () => { state.settings.sceneDuration = parseInt($('#sceneDuration').value, 10); saveState(); });
 $('#aspectRatio').addEventListener('change', () => { state.settings.aspectRatio = $('#aspectRatio').value; saveState(); });
 $('#videoStyle').addEventListener('change', () => { state.settings.videoStyle = $('#videoStyle').value.trim(); saveState(); });
+$('#videoRpm').addEventListener('change', () => { state.settings.videoRpm = parseInt($('#videoRpm').value, 10) || 1; saveState(); });
 
 function updateKeyBadge(valid) {
   const b = $('#keyBadge');
@@ -681,6 +771,7 @@ if (state.settings) {
   $('#sceneDuration').value = state.settings.sceneDuration || 5;
   $('#aspectRatio').value = state.settings.aspectRatio || '16:9';
   $('#videoStyle').value = state.settings.videoStyle || '';
+  $('#videoRpm').value = state.settings.videoRpm || 1;
 }
 if (state.scenes.length === 0) {
   // seed one empty scene to get started

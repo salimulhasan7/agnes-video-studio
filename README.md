@@ -64,4 +64,17 @@ https://<your-username>.github.io/<repo-name>/
 
 ## Note
 
-Agnes API বর্তমানে **$0/second** ভিডিও প্রাইসে আছে (বিনামূল্যে)। Free account-এ RPM limit থাকতে পারে — অনেক scene generate করলে কিছুক্ষণ অপেক্ষা করুন।
+Agnes API বর্তমানে **$0/second** ভিডিও প্রাইসে আছে (বিনামূল্যে)।
+
+### Rate limits (RPM) — গুরুত্বপূর্ণ
+
+- **Video**: Free/default account-এ **1 request/minute**। API মেসেজ দেয়: `video generation rate limit exceeded: allows 1 requests per 1 minute(s)`।
+- Image / chat: সাধারণত ~20 requests/minute।
+
+টুল **স্বয়ংক্রিয়ভাবে** এই limit মেনে চলে:
+
+1. প্রতিটি video request-এর মাঝে `Video requests per minute` সেটিং (Settings-এ) অনুযায়ী অপেক্ষা করে (free-তে default 1/min)।
+2. "Generate full video" চালালে scene-গুলোর মাঝে countdown দেখায় (`Waiting Ns (video rate limit)…`)।
+3. তবুও কোনো 429/rate-limit error এলে 1 মিনিট অপেক্ষা করে **automatic retry** করে — pipeline ভেঙে যায় না।
+
+> টিপ: এক_account-এ একাধিক ভিডিও একসাথে লাগাতে চাইলে Token Plan-এ আপগ্রেড করে Settings-এ `Video requests per minute` বাড়িয়ে নিন।
