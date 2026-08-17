@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816f';
+const APP_VERSION = '20260816g';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -310,95 +310,6 @@ async function pollVideo(videoId) {
   throw new Error('Video status query returned an invalid response');
 }
 
-/* upload a dataURL (last frame) to a public, CORS-friendly host */
-async function uploadFrame(dataUrl, scope) {
-  try {
-    const blob = await (await fetch(dataUrl)).blob();
-    const fd = new FormData();
-    fd.append('file', blob, 'frame.png');
-    const res = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd });
-    const j = await res.json();
-    const url = j && j.data && j.data.url;
-    if (j && j.status !== 'success' || !url) {
-      const em = 'Frame upload failed: tmpfiles.org returned ' + res.status;
-      if (scope) log.error(scope, em, j && JSON.stringify(j));
-      throw new Error(em);
-    }
-    // convert to raw file URL for direct fetching
-    return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
-  } catch (e) {
-    if (scope) log.error(scope, 'Frame upload error', e.message);
-    throw e;
-  }
-}
-
-/* extract the last frame of a video as a PNG dataURL (Grok-style extend).
- * Strategy to work around the output host sending no CORS headers:
- *  1. Try a direct <video> load with crossOrigin=anonymous (streams, fast).
- *  2. If that fails (CORS blocked), re-download the video with fetch(mode:'no-cors')
- *     → opaque response → blob URL (same-origin) → load blob in <video> → draw.
- *     no-cors fetch works even when the server omits Access-Control-Allow-Origin.
- */
-function extractLastFrame(videoUrl, scope) {
-  return new Promise((resolve, reject) => {
-    const done = { t: false };
-    const fail = (msg) => {
-      if (scope) log.error(scope, 'Extract last frame failed', msg);
-      if (!done.t) { done.t = true; reject(new Error(msg)); }
-    };
-
-    const drawFrame = (video, blobUrl) => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth || 768;
-        canvas.height = video.videoHeight || 768;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0);
-        const url = canvas.toDataURL('image/png');
-        if (blobUrl) URL.revokeObjectURL(blobUrl);
-        if (!done.t) { done.t = true; resolve(url); }
-      } catch (e) {
-        if (blobUrl) URL.revokeObjectURL(blobUrl);
-        fail('Frame extraction blocked (video CORS — the output host does not send Access-Control-Allow-Origin). ' + e.message);
-      }
-    };
-
-    // attempt: load src into a <video>, draw last frame; on CORS error, fall back to no-cors fetch
-    const tryLoad = (src, opts) => {
-      const video = document.createElement('video');
-      if (opts.cors) video.crossOrigin = 'anonymous';
-      video.muted = true;
-      video.preload = 'auto';
-      const timer = setTimeout(() => fail('Timeout extracting frame'), 60000);
-      video.addEventListener('error', () => {
-        clearTimeout(timer);
-        if (opts.fallback) { fail('Could not load video for frame extraction (may be blocked by CORS): ' + videoUrl); return; }
-        // CORS blocked the direct stream — download via no-cors fetch (opaque response → blob)
-        log.info(scope, 'Direct video load blocked by CORS — downloading via no-cors fetch + blob URL');
-        fetch(videoUrl, { mode: 'no-cors', cache: 'no-store' })
-          .then(r => r.blob())
-          .then(blob => {
-            const blobUrl = URL.createObjectURL(blob);
-            tryLoad(blobUrl, { cors: false, fallback: true, blobUrl });
-          })
-          .catch(e => fail('Could not fetch video for frame extraction: ' + e.message));
-      });
-      video.addEventListener('loadedmetadata', () => {
-        try { video.currentTime = Math.max(0, video.duration - 0.12); }
-        catch (e) { clearTimeout(timer); fail('Cannot seek video: ' + e.message); }
-      });
-      video.addEventListener('seeked', () => {
-        clearTimeout(timer);
-        drawFrame(video, opts.blobUrl);
-      });
-      video.src = src;
-      video.load();
-    };
-
-    tryLoad(videoUrl, { cors: true, fallback: false, blobUrl: null });
-  });
-}
-
 /* =====================================================================
  * SCENES RENDERING
  * ===================================================================== */
@@ -619,10 +530,8 @@ async function generateOneScene(scene, el, fresh) {
       log.info(sc, 'Extending from previous scene last frame...');
       try {
         const frame = await extractLastFrame(prev.videoUrl, sc);
-        log.success(sc, 'Last frame extracted OK');
-        const pub = await uploadFrame(frame, sc);
-        log.success(sc, 'Frame uploaded to public URL: ' + pub);
-        imageUrl = pub;
+        log.success(sc, 'Last frame extracted (used as ti2vid start frame)');
+        imageUrl = frame;
         scene.extendFrom = prev.videoUrl;
       } catch (e) {
         log.warn(sc, 'Extend failed — falling back to text-to-video', e.message);
@@ -781,6 +690,7 @@ $('#btnGenerateAll').addEventListener('click', async () => {
   if (pending.length === 0) { toast('Nothing to generate', true); return; }
 
   pipelineRunning = true;
+  const scenesToRun = state.scenes.filter(s => s.status !== 'completed');
   log.info('system', 'Pipeline started — ' + scenesToRun.length + ' scene(s) to generate');
   $('#btnGenerateAll').disabled = true;
   $('#btnGenerateAll').textContent = '⏳ Generating…';
@@ -793,7 +703,6 @@ $('#btnGenerateAll').addEventListener('click', async () => {
       : `Waiting ${secs}s (${what} rate limit)…`;
   };
 
-  const scenesToRun = state.scenes.filter(s => s.status !== 'completed');
   for (let i = 0; i < scenesToRun.length; i++) {
     const scene = scenesToRun[i];
     const el = $(`.scene[data-id="${scene.id}"]`);
@@ -892,9 +801,11 @@ $('#fullPlayer').addEventListener('ended', () => {
 });
 
 /* =====================================================================
- * CONCATENATE ALL SCENES -> ONE MP4 (client-side, ffmpeg.wasm)
+ * FFMPEG.WASM (shared singleton for frame extraction + concatenation)
  * ===================================================================== */
-let ffmpegReady = null;
+let ffmpegModule = null;
+let ffmpegSingleton = null;
+let ffmpegLoadPromise = null;
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
@@ -904,18 +815,46 @@ function loadScript(src) {
     document.head.appendChild(s);
   });
 }
-async function ensureFFmpeg() {
-  if (ffmpegReady) return ffmpegReady;
+/* load the ffmpeg.wasm UMD module once (30MB, cached by browser after first) */
+async function ensureFFmpegModule() {
+  if (ffmpegModule) return ffmpegModule;
   const status = $('#concatStatus');
   status.textContent = 'Loading ffmpeg.wasm (~30MB, first time only)…';
-  log.info('system', 'Loading ffmpeg.wasm for concatenation...');
+  log.info('system', 'Loading ffmpeg.wasm...');
   try {
     await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
     if (!window.FFmpeg) throw new Error('ffmpeg failed to initialize');
-    ffmpegReady = window.FFmpeg;
-    return ffmpegReady;
+    ffmpegModule = window.FFmpeg;
+    status.textContent = '';
+    return ffmpegModule;
   } catch (e) {
     log.error('system', 'Could not load ffmpeg.wasm', e.message);
+    status.textContent = '';
+    throw e;
+  }
+}
+/* get a single loaded createFFmpeg instance (reused by extract + concat) */
+async function getFFmpeg() {
+  if (ffmpegSingleton) return ffmpegSingleton;
+  if (ffmpegLoadPromise) return ffmpegLoadPromise;
+  const status = $('#concatStatus');
+  status.textContent = 'Booting ffmpeg core…';
+  ffmpegLoadPromise = (async () => {
+    const { createFFmpeg } = await ensureFFmpegModule();
+    const ffmpeg = createFFmpeg({
+      log: false,
+      mainName: 'main',
+      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    });
+    await ffmpeg.load();
+    ffmpegSingleton = ffmpeg;
+    status.textContent = '';
+    return ffmpeg;
+  })();
+  try {
+    return await ffmpegLoadPromise;
+  } catch (e) {
+    ffmpegLoadPromise = null;
     status.textContent = '';
     throw e;
   }
@@ -925,6 +864,31 @@ async function ensureFFmpeg() {
 async function downloadVideoBlob(url) {
   const res = await fetch(url, { mode: 'no-cors', cache: 'no-store' });
   return res.blob();
+}
+
+/* extract the last frame of a video as a base64 PNG data URL (reference parity:
+ * uses ffmpeg.wasm `-sseof -0.1` so the next scene starts from the previous last frame) */
+async function extractLastFrame(videoUrl, scope) {
+  const ffmpeg = await getFFmpeg();
+  const { fetchFile } = await ensureFFmpegModule();
+  const inputName = `frame_input_${Date.now()}.mp4`;
+  const outputName = `frame_${Date.now()}.png`;
+  try {
+    const blob = await downloadVideoBlob(videoUrl);
+    ffmpeg.FS('writeFile', inputName, await fetchFile(blob));
+    await ffmpeg.run('-sseof', '-0.1', '-i', inputName, '-frames:v', '1', '-y', outputName);
+    const data = ffmpeg.FS('readFile', outputName);
+    const bytes = new Uint8Array(data.byteLength);
+    bytes.set(data);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const b64 = btoa(binary);
+    if (scope) log.success(scope, 'Last frame extracted via ffmpeg (ti2vid start frame)');
+    return `data:image/png;base64,${b64}`;
+  } finally {
+    try { ffmpeg.FS('unlink', inputName); } catch (e) { /* ignore */ }
+    try { ffmpeg.FS('unlink', outputName); } catch (e) { /* ignore */ }
+  }
 }
 
 async function concatAllScenes() {
@@ -939,13 +903,8 @@ async function concatAllScenes() {
   btn.disabled = true;
 
   try {
-    const { createFFmpeg, fetchFile } = await ensureFFmpeg();
-    const ffmpeg = createFFmpeg({
-      log: false,
-      mainName: 'main',
-      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
-    });
-    await ffmpeg.load();
+    const ffmpeg = await getFFmpeg();
+    const { fetchFile } = await ensureFFmpegModule();
 
     // 1. write every clip into ffmpeg's FS as clip_i.mp4
     status.textContent = `Downloading ${completed.length} clips…`;
