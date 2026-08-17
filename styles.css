@@ -107,6 +107,9 @@ textarea { width: 100%; resize: vertical; }
 .error-box { margin-top: 12px; background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.4); color: #fecaca; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
 .hidden { display: none !important; }
 
+.concat-row { margin-top: 10px; align-items: center; }
+.concat-row .btn-accent { text-decoration: none; text-align: center; }
+
 .pipeline-status { font-size: 13px; color: var(--cyan); font-weight: 600; }
 
 /* ============ SCENES ============ */

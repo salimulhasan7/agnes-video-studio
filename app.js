@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816e';
+const APP_VERSION = '20260816f';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -409,7 +409,7 @@ function renderScenes() {
   list.innerHTML = '';
   state.scenes.forEach((scene, i) => {
     const el = document.createElement('div');
-    el.className = 'scene';
+    el.className = 'scene' + (scene.videoUrl ? ' has-video' : '');
     el.dataset.id = scene.id;
     el.innerHTML = `
       <div class="scene-num">${i + 1}</div>
@@ -824,6 +824,13 @@ $('#btnGenerateAll').addEventListener('click', async () => {
   onRateWait = null;
   updatePlayer();
   toast('Pipeline finished');
+
+  // all scenes done → automatically build the concatenated single MP4
+  const done = state.scenes.filter(s => s.status === 'completed' && s.videoUrl);
+  if (done.length >= 2 && done.length === state.scenes.length) {
+    log.info('system', 'All scenes complete — auto-concatenating...');
+    await concatAllScenes();
+  }
 });
 
 function sceneIndex(scene) { return state.scenes.findIndex(s => s.id === scene.id); }
@@ -883,6 +890,105 @@ $('#fullPlayer').addEventListener('ended', () => {
     $('#fullPlayer').play();
   }
 });
+
+/* =====================================================================
+ * CONCATENATE ALL SCENES -> ONE MP4 (client-side, ffmpeg.wasm)
+ * ===================================================================== */
+let ffmpegReady = null;
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('Failed to load ' + src));
+    document.head.appendChild(s);
+  });
+}
+async function ensureFFmpeg() {
+  if (ffmpegReady) return ffmpegReady;
+  const status = $('#concatStatus');
+  status.textContent = 'Loading ffmpeg.wasm (~30MB, first time only)…';
+  log.info('system', 'Loading ffmpeg.wasm for concatenation...');
+  try {
+    await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
+    if (!window.FFmpeg) throw new Error('ffmpeg failed to initialize');
+    ffmpegReady = window.FFmpeg;
+    return ffmpegReady;
+  } catch (e) {
+    log.error('system', 'Could not load ffmpeg.wasm', e.message);
+    status.textContent = '';
+    throw e;
+  }
+}
+
+/* download a scene video into a Blob, bypassing the missing CORS headers */
+async function downloadVideoBlob(url) {
+  const res = await fetch(url, { mode: 'no-cors', cache: 'no-store' });
+  return res.blob();
+}
+
+async function concatAllScenes() {
+  const completed = state.scenes.filter(s => s.status === 'completed' && s.videoUrl);
+  if (completed.length === 0) { toast('No completed scenes to concatenate', true); return; }
+  if (completed.length < 2) { toast('Need at least 2 completed scenes to concatenate', true); return; }
+
+  const btn = $('#btnConcat');
+  const status = $('#concatStatus');
+  const dl = $('#concatDownload');
+  dl.classList.add('hidden');
+  btn.disabled = true;
+
+  try {
+    const { createFFmpeg, fetchFile } = await ensureFFmpeg();
+    const ffmpeg = createFFmpeg({
+      log: false,
+      mainName: 'main',
+      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    });
+    await ffmpeg.load();
+
+    // 1. write every clip into ffmpeg's FS as clip_i.mp4
+    status.textContent = `Downloading ${completed.length} clips…`;
+    log.info('system', 'Concat: downloading ' + completed.length + ' clips');
+    const lines = [];
+    for (let i = 0; i < completed.length; i++) {
+      status.textContent = `Downloading clip ${i + 1}/${completed.length}…`;
+      const blob = await downloadVideoBlob(completed[i].videoUrl);
+      ffmpeg.FS('writeFile', `clip_${i}.mp4`, await fetchFile(blob));
+      lines.push(`file 'clip_${i}.mp4'`);
+      log.info('system', `Concat: clip ${i + 1} loaded (${(blob.size / 1048576).toFixed(1)} MB)`);
+    }
+    ffmpeg.FS('writeFile', 'list.txt', lines.join('\n'));
+
+    // 2. concat with stream copy (fast, no quality loss — clips share codec/res)
+    status.textContent = 'Concatenating… (stream copy, no re-encode)';
+    log.info('system', 'Concat: running ffmpeg concat demuxer with -c copy');
+    await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4');
+
+    // 3. read result and expose download + preview
+    const data = ffmpeg.FS('readFile', 'output.mp4');
+    const blob = new Blob([data.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+    dl.href = url;
+    dl.download = `${(state.projectTitle || 'full-video').replace(/[^\w\-]+/g, '_')}.mp4`;
+    dl.classList.remove('hidden');
+    $('#fullPlayer').src = url;
+    $('#playerOverlay').classList.add('hidden');
+    const sizeMb = (blob.size / 1048576).toFixed(1);
+    status.textContent = `✓ ${completed.length} clips → ${sizeMb} MB`;
+    log.success('system', `Concat complete: ${completed.length} clips, ${sizeMb} MB (stream-copied, no re-encode)`);
+    toast('Concatenated! Download or press ▶ to preview');
+    renderScenes();
+  } catch (e) {
+    status.textContent = '';
+    log.error('system', 'Concat failed', e.message);
+    toast('Concat failed: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#btnConcat').addEventListener('click', concatAllScenes);
 
 /* =====================================================================
  * VOICEOVER (Bangla)
