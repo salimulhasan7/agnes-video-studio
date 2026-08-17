@@ -24,18 +24,54 @@ const RATIO_SIZES = {
   '1:1':  { width: 768, height: 768 },
 };
 
-const DURATION_FRAMES = { 3: 81, 5: 121, 10: 241, 18: 441 };
+/* Duration presets — frames @24fps (frame = seconds*24+1), aligned to the reference
+ * implementation. All fit within the 720p tier cap (409 frames ≈ 17s) after clamping. */
+const DURATION_FRAMES = { 3: 81, 5: 121, 8: 193, 10: 241, 12: 289, 18: 441 };
 const FRAME_RATE = 24;
+
+/* Agnes normalizes resolution into tiers. Frame budget depends on the tier:
+ *   > 1280×720 (1080p tier) → max 169 frames
+ *   > 854×480  (720p tier)  → max 409 frames
+ *   else                    → max 961 frames
+ * Clamp num_frames to the tier cap so long clips don't get rejected.
+ */
+function clampFrames(width, height, numFrames) {
+  const pixels = (width || 1152) * (height || 768);
+  const max = pixels > 1280 * 720 ? 169 : pixels > 854 * 480 ? 409 : 961;
+  return Math.max(1, Math.min(numFrames || 121, max));
+}
+
+/* The status API can return the finished video URL under several shapes;
+ * try them all (reference implementation parity) instead of only metadata.url. */
+function extractVideoUrl(d) {
+  if (!d || typeof d !== 'object') return null;
+  const candidates = [
+    d.video_url, d.url, d.videoUrl,
+    d.data && d.data.video_url, d.data && d.data.url, d.data && d.data.videoUrl,
+    d.result && d.result.video_url, d.result && d.result.url, d.result && d.result.videoUrl,
+    d.metadata && d.metadata.video_url, d.metadata && d.metadata.url, d.metadata && d.metadata.videoUrl,
+    d.output && d.output.url,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.startsWith('http')) return c;
+  }
+  return null;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 /* ---------- rate limiting ----------
  * Agnes enforces RPM per account. Video on the free tier is 1 req/min.
- * We throttle creation client-side AND auto-retry after a 429.
+ * Polling is deliberately slow (60s) to stay within the status-query quota.
  * A callback lets the pipeline show a live countdown to the user.
  */
 const VIDEO_RPM_OPTIONS = { 1: 62000, 2: 32000, 5: 15000, 10: 9000 };
+const POLL_INTERVAL = 60000;          // status query interval (reference: 60s)
+const MAX_POLL_TIME = 1800000;        // 30 min max per scene
+const MAX_CONSECUTIVE_FAILURES = 10;  // give up after N consecutive poll failures
+const MAX_SUBMIT_RETRIES = 5;         // submit retries with linear backoff
+const RETRY_BASE_DELAY = 30000;       // delay = 30s * (attempt+1)
 const MIN_INTERVALS = {
   video: () => VIDEO_RPM_OPTIONS[state.settings.videoRpm || 1] || 62000,
   image: () => 3200,   // image ~20 rpm → 3.2s spacing
@@ -164,15 +200,43 @@ async function generateImage(prompt, ratio) {
     });
 }
 
+/* Determine whether a submit/poll error is retryable (reference parity):
+ * 401 (invalid key) and other 4xx are fatal; 429/5xx/network/timeout are retryable. */
+function isRetryableError(err) {
+  if (!err) return false;
+  if (err.status >= 500) return true;
+  if (err.status === 429) return true;
+  if (/rate limit/i.test(err.message || '')) return true;
+  if (!err.status && /network|failed to fetch|timeout|invalid response/i.test(err.message || '')) return true;
+  return false;
+}
+
+/* Submit one video task with linear-backoff retries.
+ * delay = RETRY_BASE_DELAY * (attempt+1): 30s, 60s, 90s, 120s, 150s (max 5 attempts).
+ */
 async function createVideoTask(params) {
-  const data = await retryOnRateLimit(() => throttle('video')
-    .then(() => apiFetch('/v1/videos', {
-      method: 'POST', headers: authHeaders(),
-      body: JSON.stringify(Object.assign({ model: VIDEO_MODEL }, params)),
-    })), 'video');
-  const videoId = data.video_id || data.task_id || data.id;
-  if (!videoId) throw new Error('Video task creation failed: no id returned');
-  return { videoId, taskId: data.task_id || data.id, data };
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_SUBMIT_RETRIES; attempt++) {
+    try {
+      await throttle('video');
+      const data = await apiFetch('/v1/videos', {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify(Object.assign({ model: VIDEO_MODEL }, params)),
+      });
+      const videoId = data.video_id || data.task_id || data.id;
+      if (!videoId) throw new Error('Video task creation failed: no id returned');
+      return { videoId, taskId: data.task_id || data.id, data };
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableError(err) || attempt === MAX_SUBMIT_RETRIES - 1) throw err;
+      const delay = RETRY_BASE_DELAY * (attempt + 1);
+      const secs = Math.round(delay / 1000);
+      if (onRateWait) onRateWait(secs, 'video', true);
+      else toast(`Rate limit: retrying video submission in ${secs}s…`, true);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
 }
 
 async function pollVideo(videoId) {
@@ -462,7 +526,7 @@ async function generateOneScene(scene, el, fresh) {
     prompt: scene.videoPrompt,
     height: scene.height || 768,
     width: scene.width || 1152,
-    num_frames: scene.numFrames || 121,
+    num_frames: clampFrames(scene.width || 1152, scene.height || 768, scene.numFrames || 121),
     frame_rate: scene.frameRate || 24,
   };
   if (imageUrl) {
@@ -497,19 +561,21 @@ function prevCompletedScene(scene) {
 
 function pollUntilDone(scene, el) {
   return new Promise((resolve, reject) => {
-    let attempts = 0;
+    let consecutiveFails = 0;
+    const startedAt = Date.now();
     const tick = async () => {
-      attempts++;
-      if (attempts > 600) return reject(new Error('Timeout waiting for video'));
+      if (Date.now() - startedAt > MAX_POLL_TIME) {
+        return reject(new Error('Timeout waiting for video (>30 min)'));
+      }
       try {
         const d = await pollVideo(scene.videoId);
         const status = d.status || '';
-        const progress = d.progress != null ? d.progress : (attempts * 5);
+        const progress = d.progress != null ? d.progress : 0;
 
         if (status === 'completed') {
-          // safety: completed must carry a usable download URL; otherwise keep polling (not done yet)
-          if (d.metadata && d.metadata.url) {
-            scene.videoUrl = d.metadata.url;
+          const url = extractVideoUrl(d);
+          if (url) {
+            scene.videoUrl = url;
             scene.seconds = d.seconds ? String(parseFloat(d.seconds).toFixed(1)) : scene.seconds;
             setSceneStatus(scene, el, 'completed', 100);
             return resolve(d);
@@ -517,7 +583,7 @@ function pollUntilDone(scene, el) {
           // completed but no URL yet — treat as still processing, keep waiting
           const p = Math.min(99, Math.max(0, progress));
           setSceneStatus(scene, el, 'progress', p);
-          await sleep(10000);
+          await sleep(POLL_INTERVAL);
           tick();
           return;
         }
@@ -528,22 +594,26 @@ function pollUntilDone(scene, el) {
 
         const p = Math.min(99, Math.max(0, progress));
         setSceneStatus(scene, el, 'progress', p);
-        await sleep(10000);
+        await sleep(POLL_INTERVAL);
         tick();
       } catch (e) {
         const rl = parseRateLimit(e);
         if (rl) {
           // poll got rate-limited; wait out the window and resume polling
-          if (attempts < 20) {
+          if (consecutiveFails < MAX_CONSECUTIVE_FAILURES) {
             const waitMs = rl.perMinutes * 60000;
             if (onRateWait) onRateWait(Math.ceil(waitMs / 1000), 'poll', true);
             await sleep(waitMs);
             tick();
           } else return reject(e);
-        } else if (attempts < 5) {
-          // transient network errors: retry a few times
-          await sleep(10000); tick();
-        } else return reject(e);
+        } else if (consecutiveFails < MAX_CONSECUTIVE_FAILURES) {
+          // transient network errors: count it, keep trying (interval between polls)
+          consecutiveFails++;
+          await sleep(POLL_INTERVAL);
+          tick();
+        } else {
+          return reject(new Error('Too many consecutive polling failures: ' + (e.message || 'network error')));
+        }
       }
     };
     tick();
