@@ -144,6 +144,19 @@
     <div id="voiceList" class="voice-list"></div>
   </section>
 
+  <!-- ============ LOG PANEL ============ -->
+  <section class="card" id="logCard">
+    <div class="card-head log-head">
+      <h2>📋 Run Log</h2>
+      <p>প্রতিটি ধাপের লগ — ভুল হলে আসল কারণ এখানে দেখুন।</p>
+      <div class="log-actions">
+        <button class="btn btn-ghost btn-sm" id="btnToggleLog">Expand</button>
+        <button class="btn btn-ghost btn-sm" id="btnClearLog">Clear</button>
+      </div>
+    </div>
+    <div id="logList" class="log-list log-collapsed"></div>
+  </section>
+
   <footer class="foot">
     <p>Powered by <a href="https://agnes-ai.com" target="_blank" rel="noopener">Agnes AI</a> API (agnes-video-v2.0 · agnes-image-2.1-flash · agnes-2.5-flash). Static site — deploy on GitHub Pages.</p>
   </footer>
@@ -151,6 +164,6 @@
 </main>
 
 <div id="toast" class="toast hidden"></div>
-<script src="app.js?v=20260816c"></script>
+<script src="app.js?v=20260816d"></script>
 </body>
 </html>

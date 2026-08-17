@@ -172,6 +172,33 @@ textarea { width: 100%; resize: vertical; }
 .voice-meta { font-size: 11.5px; color: var(--muted); }
 .voice-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
+/* ============ LOG PANEL ============ */
+.log-head { position: relative; }
+.log-actions { display: flex; gap: 8px; margin-top: 8px; }
+.btn-sm { font-size: 12px; padding: 5px 10px; }
+.log-list {
+  background: #0a0e16; border: 1px solid var(--border); border-radius: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5; max-height: 260px; overflow-y: auto;
+  padding: 10px 12px;
+}
+.log-list.log-collapsed { max-height: 120px; }
+.log-empty { color: var(--muted); font-style: italic; }
+.log-row { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; border-bottom: 1px dashed #1a2233; }
+.log-row:last-child { border-bottom: none; }
+.log-time { color: var(--muted); flex: 0 0 auto; }
+.log-lvl { flex: 0 0 auto; font-weight: 700; font-size: 11px; }
+.log-scope { flex: 0 0 auto; color: var(--cyan); font-weight: 700; }
+.log-msg { color: var(--text); word-break: break-word; }
+.log-raw { color: var(--muted); word-break: break-word; }
+.log-info .log-lvl { color: var(--cyan); }
+.log-warn .log-lvl { color: var(--amber); }
+.log-error .log-lvl { color: var(--red); }
+.log-success .log-lvl { color: var(--green); }
+.log-warn .log-msg { color: var(--amber); }
+.log-error .log-msg { color: #fecaca; }
+.log-success .log-msg { color: var(--green); }
+
 /* ============ TOAST ============ */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);

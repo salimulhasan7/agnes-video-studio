@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816c';
+const APP_VERSION = '20260816d';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -147,6 +147,60 @@ function saveState() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
 }
 
+/* ---------- logger ----------
+ * In-memory ring buffer of run logs, shown in the Log panel.
+ * Each entry: time, level (info/warn/error/success), scope (scene:N / system),
+ * message, and optional raw error text for diagnosis.
+ */
+const MAX_LOGS = 500;
+const logEntries = [];
+let logSeq = 1;
+
+function loggerAdd(level, scope, message, raw) {
+  logEntries.push({ id: logSeq++, ts: Date.now(), level, scope, message, raw });
+  if (logEntries.length > MAX_LOGS) logEntries.shift();
+  renderLogs();
+}
+const log = {
+  info:  (scope, message) => loggerAdd('info', scope, message),
+  warn:  (scope, message, raw) => loggerAdd('warn', scope, message, raw),
+  error: (scope, message, raw) => loggerAdd('error', scope, message, raw),
+  success: (scope, message) => loggerAdd('success', scope, message),
+};
+function fmtLogTime(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function sceneScope(scene) {
+  const idx = state.scenes.findIndex(s => s && s.id === scene.id);
+  return idx >= 0 ? 'scene:' + (idx + 1) : 'system';
+}
+let logExpanded = false;
+function renderLogs() {
+  const list = $('#logList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (logEntries.length === 0) {
+    list.innerHTML = '<p class="log-empty">No logs yet — generate a video to see progress here.</p>';
+    return;
+  }
+  logEntries.forEach(entry => {
+    const el = document.createElement('div');
+    el.className = 'log-row log-' + entry.level;
+    el.innerHTML = `
+      <span class="log-time">${fmtLogTime(entry.ts)}</span>
+      <span class="log-lvl">${entry.level.toUpperCase().slice(0, 4)}</span>
+      ${entry.scope !== 'system' ? `<span class="log-scope">${escapeHtml(entry.scope)}</span>` : ''}
+      <span class="log-msg">${escapeHtml(entry.message)}${entry.raw ? `<span class="log-raw"> — ${escapeHtml(entry.raw)}</span>` : ''}</span>
+    `;
+    list.appendChild(el);
+  });
+  if (logExpanded) {
+    list.scrollTop = list.scrollHeight;
+  }
+}
+
 /* ---------- toast ---------- */
 let toastTimer;
 function toast(msg, isErr) {
@@ -214,7 +268,7 @@ function isRetryableError(err) {
 /* Submit one video task with linear-backoff retries.
  * delay = RETRY_BASE_DELAY * (attempt+1): 30s, 60s, 90s, 120s, 150s (max 5 attempts).
  */
-async function createVideoTask(params) {
+async function createVideoTask(params, scope) {
   let lastErr;
   for (let attempt = 0; attempt < MAX_SUBMIT_RETRIES; attempt++) {
     try {
@@ -228,9 +282,11 @@ async function createVideoTask(params) {
       return { videoId, taskId: data.task_id || data.id, data };
     } catch (err) {
       lastErr = err;
+      if (scope) log.warn(scope, 'Submit attempt ' + (attempt + 1) + ' failed', err.message);
       if (!isRetryableError(err) || attempt === MAX_SUBMIT_RETRIES - 1) throw err;
       const delay = RETRY_BASE_DELAY * (attempt + 1);
       const secs = Math.round(delay / 1000);
+      if (scope) log.info(scope, 'Retrying submit in ' + secs + 's (backoff)');
       if (onRateWait) onRateWait(secs, 'video', true);
       else toast(`Rate limit: retrying video submission in ${secs}s…`, true);
       await sleep(delay);
@@ -255,33 +311,45 @@ async function pollVideo(videoId) {
 }
 
 /* upload a dataURL (last frame) to a public, CORS-friendly host */
-async function uploadFrame(dataUrl) {
-  const blob = await (await fetch(dataUrl)).blob();
-  const fd = new FormData();
-  fd.append('file', blob, 'frame.png');
-  const res = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd });
-  const j = await res.json();
-  const url = j && j.data && j.data.url;
-  if (j && j.status !== 'success' || !url) throw new Error('Frame upload failed');
-  // convert to raw file URL for direct fetching
-  return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+async function uploadFrame(dataUrl, scope) {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const fd = new FormData();
+    fd.append('file', blob, 'frame.png');
+    const res = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd });
+    const j = await res.json();
+    const url = j && j.data && j.data.url;
+    if (j && j.status !== 'success' || !url) {
+      const em = 'Frame upload failed: tmpfiles.org returned ' + res.status;
+      if (scope) log.error(scope, em, j && JSON.stringify(j));
+      throw new Error(em);
+    }
+    // convert to raw file URL for direct fetching
+    return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+  } catch (e) {
+    if (scope) log.error(scope, 'Frame upload error', e.message);
+    throw e;
+  }
 }
 
 /* extract the last frame of a video as a PNG dataURL (Grok-style extend) */
-function extractLastFrame(videoUrl) {
+function extractLastFrame(videoUrl, scope) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
     video.crossOrigin = 'anonymous';
     video.muted = true;
     video.preload = 'auto';
     const done = { t: false };
-    const fail = (msg) => { if (!done.t) { done.t = true; reject(new Error(msg)); } };
+    const fail = (msg) => {
+      if (scope) log.error(scope, 'Extract last frame failed', msg);
+      if (!done.t) { done.t = true; reject(new Error(msg)); }
+    };
     const timer = setTimeout(() => fail('Timeout extracting frame'), 30000);
 
-    video.addEventListener('error', () => fail('Could not load video for frame extraction (may be blocked by CORS)'));
+    video.addEventListener('error', () => fail('Could not load video for frame extraction (may be blocked by CORS): ' + videoUrl));
     video.addEventListener('loadedmetadata', () => {
       try { video.currentTime = Math.max(0, video.duration - 0.12); }
-      catch (e) { fail('Cannot seek video'); }
+      catch (e) { fail('Cannot seek video: ' + e.message); }
     });
     video.addEventListener('seeked', () => {
       try {
@@ -295,7 +363,7 @@ function extractLastFrame(videoUrl) {
         if (!done.t) { done.t = true; resolve(url); }
       } catch (e) {
         clearTimeout(timer);
-        fail('Frame extraction blocked (video CORS). ' + e.message);
+        fail('Frame extraction blocked (video CORS — the output host does not send Access-Control-Allow-Origin). ' + e.message);
       }
     });
     video.src = videoUrl;
@@ -412,6 +480,7 @@ $('#btnGenStoryboard').addEventListener('click', async () => {
   const btn = $('#btnGenStoryboard');
   btn.disabled = true;
   btn.textContent = '⏳ Generating storyboard…';
+  log.info('system', 'Storyboard generation started (' + count + ' scenes)');
   try {
     const sys = `You are a film storyboard director. Split the user's story into exactly ${count} sequential scenes. Each scene must have:
 - "video_prompt": a detailed ENGLISH text-to-video prompt describing subject, action, scene, camera movement, lighting and style${style ? ', style: ' + style : ''}. Write it as one continuous sentence for an AI video model.
@@ -443,10 +512,12 @@ Respond ONLY with valid JSON: {"title":"...","scenes":[{"video_prompt":"...","na
     saveState();
     renderScenes();
     renderVoiceover();
+    log.success('system', 'Storyboard ready: ' + state.scenes.length + ' scenes — "' + (json.title || '') + '"');
     toast(`Storyboard ready: ${state.scenes.length} scenes`);
   } catch (e) {
     err.textContent = 'Error: ' + e.message;
     err.classList.remove('hidden');
+    log.error('system', 'Storyboard generation failed', e.message);
     toast('Storyboard failed: ' + e.message, true);
   } finally {
     btn.disabled = false;
@@ -484,12 +555,16 @@ async function generateSceneImage(scene, el) {
   if (!prompt) { toast('Write a video prompt first', true); return; }
   const btn = el.querySelector('.act-image');
   btn.disabled = true; btn.textContent = '⏳';
+  const sc = sceneScope(scene);
   try {
+    log.info(sc, 'Generating keyframe image...');
     const url = await generateImage(prompt + (state.settings.videoStyle ? ', style: ' + state.settings.videoStyle : ''), scene.ratio || '16:9');
     scene.keyframeImage = url;
     saveState();
+    log.success(sc, 'Keyframe image ready: ' + url);
     toast('Keyframe image generated ✓ (used as image-to-video base)');
   } catch (e) {
+    log.error(sc, 'Keyframe image failed', e.message);
     toast('Keyframe failed: ' + e.message, true);
   } finally {
     btn.disabled = false; btn.textContent = '🖼 Keyframe image';
@@ -505,20 +580,29 @@ async function generateOneScene(scene, el, fresh) {
 
   // if a previous completed scene exists and this is not fresh, try extending from its last frame
   let imageUrl = scene.keyframeImage || null;
+  const sc = sceneScope(scene);
 
-  if (!imageUrl) {
+  if (imageUrl) {
+    log.info(sc, 'Using saved keyframe image as starting frame');
+  } else {
     const prev = prevCompletedScene(scene);
     if (prev && prev.videoUrl) {
       setSceneStatus(scene, el, 'extending', 2);
+      log.info(sc, 'Extending from previous scene last frame...');
       try {
-        const frame = await extractLastFrame(prev.videoUrl);
-        const pub = await uploadFrame(frame);
+        const frame = await extractLastFrame(prev.videoUrl, sc);
+        log.success(sc, 'Last frame extracted OK');
+        const pub = await uploadFrame(frame, sc);
+        log.success(sc, 'Frame uploaded to public URL: ' + pub);
         imageUrl = pub;
         scene.extendFrom = prev.videoUrl;
       } catch (e) {
+        log.warn(sc, 'Extend failed — falling back to text-to-video', e.message);
         toast('Extend from last frame failed, using text-to-video instead: ' + e.message, true);
         imageUrl = null;
       }
+    } else {
+      log.info(sc, 'No previous scene — generating from text prompt');
     }
   }
 
@@ -535,16 +619,20 @@ async function generateOneScene(scene, el, fresh) {
   }
 
   setSceneStatus(scene, el, 'queued', 3);
+  log.info(sc, 'Submitting video task (image=' + (imageUrl ? 'yes, ti2vid' : 'none, t2v') + ')');
   try {
-    const { videoId } = await createVideoTask(params);
+    const { videoId } = await createVideoTask(params, sc);
     scene.videoId = videoId;
+    log.success(sc, 'Video task submitted, videoId=' + videoId);
     await pollUntilDone(scene, el);
+    log.success(sc, 'Scene completed: ' + (scene.videoUrl || ''));
     renderScenes();
     renderVoiceover();
     updatePlayer();
     toast(`Scene generated ✓ (${scene.seconds || '?'}s)`);
   } catch (e) {
     scene.error = e.message;
+    log.error(sc, 'Scene failed', e.message);
     setSceneStatus(scene, el, 'failed', scene.progress);
     toast('Scene failed: ' + e.message, true);
   }
@@ -562,15 +650,19 @@ function prevCompletedScene(scene) {
 function pollUntilDone(scene, el) {
   return new Promise((resolve, reject) => {
     let consecutiveFails = 0;
+    let pollCount = 0;
+    const sc = sceneScope(scene);
     const startedAt = Date.now();
     const tick = async () => {
       if (Date.now() - startedAt > MAX_POLL_TIME) {
+        log.error(sc, 'Poll timeout (>30 min)');
         return reject(new Error('Timeout waiting for video (>30 min)'));
       }
       try {
         const d = await pollVideo(scene.videoId);
         const status = d.status || '';
         const progress = d.progress != null ? d.progress : 0;
+        pollCount++;
 
         if (status === 'completed') {
           const url = extractVideoUrl(d);
@@ -578,22 +670,28 @@ function pollUntilDone(scene, el) {
             scene.videoUrl = url;
             scene.seconds = d.seconds ? String(parseFloat(d.seconds).toFixed(1)) : scene.seconds;
             setSceneStatus(scene, el, 'completed', 100);
+            log.success(sc, 'Polling finished — video ready after ' + pollCount + ' check(s)');
             return resolve(d);
           }
           // completed but no URL yet — treat as still processing, keep waiting
           const p = Math.min(99, Math.max(0, progress));
           setSceneStatus(scene, el, 'progress', p);
+          log.info(sc, 'Status completed but no URL yet, still waiting (check #' + pollCount + ')');
           await sleep(POLL_INTERVAL);
           tick();
           return;
         }
         if (status === 'failed') {
           const em = (d.error && (d.error.message || d.error.code)) || 'Generation failed';
+          log.error(sc, 'Video generation reported failed', em);
           return reject(new Error(em));
         }
 
         const p = Math.min(99, Math.max(0, progress));
         setSceneStatus(scene, el, 'progress', p);
+        if (pollCount === 1 || pollCount % 5 === 0) {
+          log.info(sc, 'Polling... status=' + (status || 'processing') + ' progress=' + progress + '% (check #' + pollCount + ')');
+        }
         await sleep(POLL_INTERVAL);
         tick();
       } catch (e) {
@@ -602,6 +700,8 @@ function pollUntilDone(scene, el) {
           // poll got rate-limited; wait out the window and resume polling
           if (consecutiveFails < MAX_CONSECUTIVE_FAILURES) {
             const waitMs = rl.perMinutes * 60000;
+            consecutiveFails++;
+            log.warn(sc, 'Poll rate-limited, waiting ' + Math.ceil(waitMs / 1000) + 's (fail #' + consecutiveFails + ')', e.message);
             if (onRateWait) onRateWait(Math.ceil(waitMs / 1000), 'poll', true);
             await sleep(waitMs);
             tick();
@@ -609,9 +709,11 @@ function pollUntilDone(scene, el) {
         } else if (consecutiveFails < MAX_CONSECUTIVE_FAILURES) {
           // transient network errors: count it, keep trying (interval between polls)
           consecutiveFails++;
+          log.warn(sc, 'Poll error (consecutive fail #' + consecutiveFails + ')', e.message);
           await sleep(POLL_INTERVAL);
           tick();
         } else {
+          log.error(sc, 'Too many consecutive polling failures', e.message);
           return reject(new Error('Too many consecutive polling failures: ' + (e.message || 'network error')));
         }
       }
@@ -651,11 +753,13 @@ $('#btnGenerateAll').addEventListener('click', async () => {
   if (pending.length === 0) { toast('Nothing to generate', true); return; }
 
   pipelineRunning = true;
+  log.info('system', 'Pipeline started — ' + scenesToRun.length + ' scene(s) to generate');
   $('#btnGenerateAll').disabled = true;
   $('#btnGenerateAll').textContent = '⏳ Generating…';
   const status = $('#pipelineStatus');
   onRateWait = (secs, kind, retried) => {
     const what = kind === 'video' ? 'video' : kind === 'image' ? 'image' : 'API';
+    log.warn('system', 'Rate limit (' + what + '): waiting ' + secs + 's', retried ? 'retry after wait' : '');
     status.textContent = retried
       ? `Rate limit hit — waiting ${secs}s before retrying ${what}…`
       : `Waiting ${secs}s (${what} rate limit)…`;
@@ -667,21 +771,25 @@ $('#btnGenerateAll').addEventListener('click', async () => {
     const el = $(`.scene[data-id="${scene.id}"]`);
     const num = sceneIndex(scene) + 1;
     status.textContent = `Scene ${num}/${state.scenes.length}: generating… (একটি করে, ধীরে ধীরে)`;
+    log.info('system', 'Pipeline: starting scene ' + num + '/' + state.scenes.length);
     // refresh prompt from textarea
     if (el) scene.videoPrompt = el.querySelector('.scene-prompt').value;
     try {
       await generateOneScene(scene, el, true);
     } catch (e) {
       // per-scene errors are already surfaced; continue with next scene
+      log.error('system', 'Pipeline: scene ' + num + ' threw an uncaught error', e.message);
     }
     // 5s pause between scenes — as per the requested pacing
     if (i < scenesToRun.length - 1) {
       status.textContent = `Scene ${num}/${state.scenes.length} done — pausing 5s before next scene…`;
+      log.info('system', 'Pipeline: pausing 5s before next scene');
       await sleep(5000);
     }
   }
 
   status.textContent = '✓ Done';
+  log.success('system', 'Pipeline finished');
   pipelineRunning = false;
   $('#btnGenerateAll').disabled = false;
   $('#btnGenerateAll').textContent = '▶ Generate full video (sequentially)';
@@ -844,6 +952,20 @@ $('#aspectRatio').addEventListener('change', () => { state.settings.aspectRatio 
 $('#videoStyle').addEventListener('change', () => { state.settings.videoStyle = $('#videoStyle').value.trim(); saveState(); });
 $('#videoRpm').addEventListener('change', () => { state.settings.videoRpm = parseInt($('#videoRpm').value, 10) || 1; saveState(); });
 
+/* ---------- log panel controls ---------- */
+$('#btnToggleLog').addEventListener('click', () => {
+  logExpanded = !logExpanded;
+  const list = $('#logList');
+  list.classList.toggle('log-collapsed', !logExpanded);
+  $('#btnToggleLog').textContent = logExpanded ? 'Collapse' : 'Expand';
+  if (logExpanded) list.scrollTop = list.scrollHeight;
+});
+$('#btnClearLog').addEventListener('click', () => {
+  logEntries.length = 0;
+  renderLogs();
+  log.info('system', 'Log cleared');
+});
+
 function updateKeyBadge(valid) {
   const b = $('#keyBadge');
   if (valid) { b.textContent = 'API key OK'; b.className = 'badge badge-on'; }
@@ -888,3 +1010,5 @@ if (state.scenes.length === 0) {
 renderScenes();
 renderVoiceover();
 updatePlayer();
+log.info('system', 'App loaded (build ' + APP_VERSION + '). Set your API key and generate a storyboard to start.');
+renderLogs();
