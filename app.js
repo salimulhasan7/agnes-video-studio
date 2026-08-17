@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816g';
+const APP_VERSION = '20260816h';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -802,10 +802,15 @@ $('#fullPlayer').addEventListener('ended', () => {
 
 /* =====================================================================
  * FFMPEG.WASM (shared singleton for frame extraction + concatenation)
+ * Uses @ffmpeg/ffmpeg 0.12 single-threaded core (reference parity) which
+ * does NOT require SharedArrayBuffer/COOP-COEP headers, so it works on
+ * GitHub Pages. Loaded lazily (~30MB, cached by the browser afterwards).
  * ===================================================================== */
 let ffmpegModule = null;
+let ffmpegUtil = null;
 let ffmpegSingleton = null;
 let ffmpegLoadPromise = null;
+const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
@@ -815,38 +820,40 @@ function loadScript(src) {
     document.head.appendChild(s);
   });
 }
-/* load the ffmpeg.wasm UMD module once (30MB, cached by browser after first) */
+/* load the ffmpeg.wasm UMD modules once (30MB, cached by browser after first) */
 async function ensureFFmpegModule() {
-  if (ffmpegModule) return ffmpegModule;
+  if (ffmpegModule) return { FFmpeg: ffmpegModule, toBlobURL: ffmpegUtil };
   const status = $('#concatStatus');
   status.textContent = 'Loading ffmpeg.wasm (~30MB, first time only)…';
-  log.info('system', 'Loading ffmpeg.wasm...');
+  log.info('system', 'Loading ffmpeg.wasm (single-threaded core)...');
   try {
-    await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
-    if (!window.FFmpeg) throw new Error('ffmpeg failed to initialize');
-    ffmpegModule = window.FFmpeg;
+    await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.12.15/dist/umd/ffmpeg.js');
+    await loadScript('https://unpkg.com/@ffmpeg/util@0.12.2/dist/umd/index.js');
+    if (!window.FFmpegWASM || !window.FFmpegWASM.FFmpeg) throw new Error('ffmpeg failed to initialize');
+    if (!window.FFmpegUtil || !window.FFmpegUtil.toBlobURL) throw new Error('ffmpeg util failed to initialize');
+    ffmpegModule = window.FFmpegWASM.FFmpeg;
+    ffmpegUtil = window.FFmpegUtil.toBlobURL;
     status.textContent = '';
-    return ffmpegModule;
+    return { FFmpeg: ffmpegModule, toBlobURL: ffmpegUtil };
   } catch (e) {
     log.error('system', 'Could not load ffmpeg.wasm', e.message);
     status.textContent = '';
     throw e;
   }
 }
-/* get a single loaded createFFmpeg instance (reused by extract + concat) */
+/* get a single loaded FFmpeg instance (reused by extract + concat) */
 async function getFFmpeg() {
-  if (ffmpegSingleton) return ffmpegSingleton;
+  if (ffmpegSingleton && ffmpegSingleton.loaded) return ffmpegSingleton;
   if (ffmpegLoadPromise) return ffmpegLoadPromise;
   const status = $('#concatStatus');
   status.textContent = 'Booting ffmpeg core…';
   ffmpegLoadPromise = (async () => {
-    const { createFFmpeg } = await ensureFFmpegModule();
-    const ffmpeg = createFFmpeg({
-      log: false,
-      mainName: 'main',
-      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    const { FFmpeg, toBlobURL } = await ensureFFmpegModule();
+    const ffmpeg = new FFmpeg();
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
     });
-    await ffmpeg.load();
     ffmpegSingleton = ffmpeg;
     status.textContent = '';
     return ffmpeg;
@@ -870,14 +877,13 @@ async function downloadVideoBlob(url) {
  * uses ffmpeg.wasm `-sseof -0.1` so the next scene starts from the previous last frame) */
 async function extractLastFrame(videoUrl, scope) {
   const ffmpeg = await getFFmpeg();
-  const { fetchFile } = await ensureFFmpegModule();
   const inputName = `frame_input_${Date.now()}.mp4`;
   const outputName = `frame_${Date.now()}.png`;
   try {
     const blob = await downloadVideoBlob(videoUrl);
-    ffmpeg.FS('writeFile', inputName, await fetchFile(blob));
-    await ffmpeg.run('-sseof', '-0.1', '-i', inputName, '-frames:v', '1', '-y', outputName);
-    const data = ffmpeg.FS('readFile', outputName);
+    await ffmpeg.writeFile(inputName, await fetchFile(blob));
+    await ffmpeg.exec(['-sseof', '-0.1', '-i', inputName, '-frames:v', '1', '-y', outputName]);
+    const data = await ffmpeg.readFile(outputName);
     const bytes = new Uint8Array(data.byteLength);
     bytes.set(data);
     let binary = '';
@@ -886,9 +892,14 @@ async function extractLastFrame(videoUrl, scope) {
     if (scope) log.success(scope, 'Last frame extracted via ffmpeg (ti2vid start frame)');
     return `data:image/png;base64,${b64}`;
   } finally {
-    try { ffmpeg.FS('unlink', inputName); } catch (e) { /* ignore */ }
-    try { ffmpeg.FS('unlink', outputName); } catch (e) { /* ignore */ }
+    try { await ffmpeg.deleteFile(inputName); } catch (e) { /* ignore */ }
+    try { await ffmpeg.deleteFile(outputName); } catch (e) { /* ignore */ }
   }
+}
+
+/* @ffmpeg/util.fetchFile-equivalent: Blob -> Uint8Array for ffmpeg FS */
+async function fetchFile(blob) {
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 async function concatAllScenes() {
@@ -904,7 +915,6 @@ async function concatAllScenes() {
 
   try {
     const ffmpeg = await getFFmpeg();
-    const { fetchFile } = await ensureFFmpegModule();
 
     // 1. write every clip into ffmpeg's FS as clip_i.mp4
     status.textContent = `Downloading ${completed.length} clips…`;
@@ -913,19 +923,19 @@ async function concatAllScenes() {
     for (let i = 0; i < completed.length; i++) {
       status.textContent = `Downloading clip ${i + 1}/${completed.length}…`;
       const blob = await downloadVideoBlob(completed[i].videoUrl);
-      ffmpeg.FS('writeFile', `clip_${i}.mp4`, await fetchFile(blob));
+      await ffmpeg.writeFile(`clip_${i}.mp4`, await fetchFile(blob));
       lines.push(`file 'clip_${i}.mp4'`);
       log.info('system', `Concat: clip ${i + 1} loaded (${(blob.size / 1048576).toFixed(1)} MB)`);
     }
-    ffmpeg.FS('writeFile', 'list.txt', lines.join('\n'));
+    await ffmpeg.writeFile('list.txt', new TextEncoder().encode(lines.join('\n')));
 
     // 2. concat with stream copy (fast, no quality loss — clips share codec/res)
     status.textContent = 'Concatenating… (stream copy, no re-encode)';
     log.info('system', 'Concat: running ffmpeg concat demuxer with -c copy');
-    await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4');
+    await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4']);
 
     // 3. read result and expose download + preview
-    const data = ffmpeg.FS('readFile', 'output.mp4');
+    const data = await ffmpeg.readFile('output.mp4');
     const blob = new Blob([data.buffer], { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
     dl.href = url;
