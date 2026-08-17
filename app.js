@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816d';
+const APP_VERSION = '20260816e';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -332,26 +332,22 @@ async function uploadFrame(dataUrl, scope) {
   }
 }
 
-/* extract the last frame of a video as a PNG dataURL (Grok-style extend) */
+/* extract the last frame of a video as a PNG dataURL (Grok-style extend).
+ * Strategy to work around the output host sending no CORS headers:
+ *  1. Try a direct <video> load with crossOrigin=anonymous (streams, fast).
+ *  2. If that fails (CORS blocked), re-download the video with fetch(mode:'no-cors')
+ *     → opaque response → blob URL (same-origin) → load blob in <video> → draw.
+ *     no-cors fetch works even when the server omits Access-Control-Allow-Origin.
+ */
 function extractLastFrame(videoUrl, scope) {
   return new Promise((resolve, reject) => {
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.muted = true;
-    video.preload = 'auto';
     const done = { t: false };
     const fail = (msg) => {
       if (scope) log.error(scope, 'Extract last frame failed', msg);
       if (!done.t) { done.t = true; reject(new Error(msg)); }
     };
-    const timer = setTimeout(() => fail('Timeout extracting frame'), 30000);
 
-    video.addEventListener('error', () => fail('Could not load video for frame extraction (may be blocked by CORS): ' + videoUrl));
-    video.addEventListener('loadedmetadata', () => {
-      try { video.currentTime = Math.max(0, video.duration - 0.12); }
-      catch (e) { fail('Cannot seek video: ' + e.message); }
-    });
-    video.addEventListener('seeked', () => {
+    const drawFrame = (video, blobUrl) => {
       try {
         const canvas = document.createElement('canvas');
         canvas.width = video.videoWidth || 768;
@@ -359,15 +355,47 @@ function extractLastFrame(videoUrl, scope) {
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0);
         const url = canvas.toDataURL('image/png');
-        clearTimeout(timer);
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
         if (!done.t) { done.t = true; resolve(url); }
       } catch (e) {
-        clearTimeout(timer);
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
         fail('Frame extraction blocked (video CORS — the output host does not send Access-Control-Allow-Origin). ' + e.message);
       }
-    });
-    video.src = videoUrl;
-    video.load();
+    };
+
+    // attempt: load src into a <video>, draw last frame; on CORS error, fall back to no-cors fetch
+    const tryLoad = (src, opts) => {
+      const video = document.createElement('video');
+      if (opts.cors) video.crossOrigin = 'anonymous';
+      video.muted = true;
+      video.preload = 'auto';
+      const timer = setTimeout(() => fail('Timeout extracting frame'), 60000);
+      video.addEventListener('error', () => {
+        clearTimeout(timer);
+        if (opts.fallback) { fail('Could not load video for frame extraction (may be blocked by CORS): ' + videoUrl); return; }
+        // CORS blocked the direct stream — download via no-cors fetch (opaque response → blob)
+        log.info(scope, 'Direct video load blocked by CORS — downloading via no-cors fetch + blob URL');
+        fetch(videoUrl, { mode: 'no-cors', cache: 'no-store' })
+          .then(r => r.blob())
+          .then(blob => {
+            const blobUrl = URL.createObjectURL(blob);
+            tryLoad(blobUrl, { cors: false, fallback: true, blobUrl });
+          })
+          .catch(e => fail('Could not fetch video for frame extraction: ' + e.message));
+      });
+      video.addEventListener('loadedmetadata', () => {
+        try { video.currentTime = Math.max(0, video.duration - 0.12); }
+        catch (e) { clearTimeout(timer); fail('Cannot seek video: ' + e.message); }
+      });
+      video.addEventListener('seeked', () => {
+        clearTimeout(timer);
+        drawFrame(video, opts.blobUrl);
+      });
+      video.src = src;
+      video.load();
+    };
+
+    tryLoad(videoUrl, { cors: true, fallback: false, blobUrl: null });
   });
 }
 
