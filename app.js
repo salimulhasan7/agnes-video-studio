@@ -10,7 +10,7 @@ const VIDEO_MODEL = 'agnes-video-v2.0';
 const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816h';
+const APP_VERSION = '20260816i';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -807,7 +807,6 @@ $('#fullPlayer').addEventListener('ended', () => {
  * GitHub Pages. Loaded lazily (~30MB, cached by the browser afterwards).
  * ===================================================================== */
 let ffmpegModule = null;
-let ffmpegUtil = null;
 let ffmpegSingleton = null;
 let ffmpegLoadPromise = null;
 const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
@@ -820,21 +819,31 @@ function loadScript(src) {
     document.head.appendChild(s);
   });
 }
-/* load the ffmpeg.wasm UMD modules once (30MB, cached by browser after first) */
+/* @ffmpeg/util.toBlobURL equivalent: fetch a URL and expose it as a same-origin blob URL
+ * (needed so the ffmpeg worker can importScripts the core without CORS restrictions) */
+async function toBlobURL(url, mimeType) {
+  const res = await fetch(url);
+  const buf = await res.arrayBuffer();
+  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+}
+/* @ffmpeg/util.fetchFile equivalent: Blob -> Uint8Array for the ffmpeg FS */
+async function fetchFile(blob) {
+  return new Uint8Array(await blob.arrayBuffer());
+}
+/* load the ffmpeg.wasm UMD module once (30MB, cached by browser after first) */
 async function ensureFFmpegModule() {
-  if (ffmpegModule) return { FFmpeg: ffmpegModule, toBlobURL: ffmpegUtil };
+  if (ffmpegModule) return ffmpegModule;
   const status = $('#concatStatus');
   status.textContent = 'Loading ffmpeg.wasm (~30MB, first time only)…';
   log.info('system', 'Loading ffmpeg.wasm (single-threaded core)...');
   try {
-    await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.12.15/dist/umd/ffmpeg.js');
-    await loadScript('https://unpkg.com/@ffmpeg/util@0.12.2/dist/umd/index.js');
+    /* ffmpeg.js is self-hosted (with its sibling 814.ffmpeg.js worker chunk) so the
+     * browser can construct the Worker same-origin (cross-origin workers are blocked) */
+    await loadScript('vendor/ffmpeg.js');
     if (!window.FFmpegWASM || !window.FFmpegWASM.FFmpeg) throw new Error('ffmpeg failed to initialize');
-    if (!window.FFmpegUtil || !window.FFmpegUtil.toBlobURL) throw new Error('ffmpeg util failed to initialize');
     ffmpegModule = window.FFmpegWASM.FFmpeg;
-    ffmpegUtil = window.FFmpegUtil.toBlobURL;
     status.textContent = '';
-    return { FFmpeg: ffmpegModule, toBlobURL: ffmpegUtil };
+    return ffmpegModule;
   } catch (e) {
     log.error('system', 'Could not load ffmpeg.wasm', e.message);
     status.textContent = '';
@@ -848,7 +857,7 @@ async function getFFmpeg() {
   const status = $('#concatStatus');
   status.textContent = 'Booting ffmpeg core…';
   ffmpegLoadPromise = (async () => {
-    const { FFmpeg, toBlobURL } = await ensureFFmpegModule();
+    const FFmpeg = await ensureFFmpegModule();
     const ffmpeg = new FFmpeg();
     await ffmpeg.load({
       coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
@@ -897,11 +906,6 @@ async function extractLastFrame(videoUrl, scope) {
   }
 }
 
-/* @ffmpeg/util.fetchFile-equivalent: Blob -> Uint8Array for ffmpeg FS */
-async function fetchFile(blob) {
-  return new Uint8Array(await blob.arrayBuffer());
-}
-
 async function concatAllScenes() {
   const completed = state.scenes.filter(s => s.status === 'completed' && s.videoUrl);
   if (completed.length === 0) { toast('No completed scenes to concatenate', true); return; }
@@ -936,7 +940,7 @@ async function concatAllScenes() {
 
     // 3. read result and expose download + preview
     const data = await ffmpeg.readFile('output.mp4');
-    const blob = new Blob([data.buffer], { type: 'video/mp4' });
+    const blob = new Blob([data], { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
     dl.href = url;
     dl.download = `${(state.projectTitle || 'full-video').replace(/[^\w\-]+/g, '_')}.mp4`;
