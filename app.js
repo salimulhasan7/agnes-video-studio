@@ -7,10 +7,9 @@
 
 const API_BASE = 'https://apihub.agnes-ai.com';
 const VIDEO_MODEL = 'agnes-video-v2.0';
-const IMAGE_MODEL = 'agnes-image-2.1-flash';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816i';
+const APP_VERSION = '20260816j';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -238,22 +237,6 @@ async function chat(messages) {
     })), 'chat');
 }
 
-async function generateImage(prompt, ratio) {
-  return retryOnRateLimit(() => throttle('image')
-    .then(() => apiFetch('/v1/images/generations', {
-      method: 'POST', headers: authHeaders(),
-      body: JSON.stringify({
-        model: IMAGE_MODEL, prompt, size: '1K', ratio,
-        extra_body: { response_format: 'url' },
-      }),
-    })), 'image')
-    .then(data => {
-      const url = data && data.data && data.data[0] && data.data[0].url;
-      if (!url) throw new Error('Image API returned no URL');
-      return url;
-    });
-}
-
 /* Determine whether a submit/poll error is retryable (reference parity):
  * 401 (invalid key) and other 4xx are fatal; 429/5xx/network/timeout are retryable. */
 function isRetryableError(err) {
@@ -337,9 +320,7 @@ function renderScenes() {
         ${scene.error ? `<div class="error-box">${escapeHtml(scene.error)}</div>` : ''}
       </div>
       <div class="scene-actions">
-        <button class="btn btn-sm btn-ghost act-image">🖼 Keyframe image</button>
         <button class="btn btn-sm btn-primary act-generate">▶ Generate</button>
-        ${i > 0 || scene.videoUrl ? `<button class="btn btn-sm btn-accent act-extend">➕ Extend</button>` : ''}
         <button class="btn btn-sm btn-danger act-delete">✕</button>
       </div>
     `;
@@ -348,18 +329,9 @@ function renderScenes() {
       scene.videoPrompt = e.target.value; saveState();
     });
 
-    el.querySelector('.act-image').addEventListener('click', async () => {
-      await generateSceneImage(scene, el);
-    });
-
     el.querySelector('.act-generate').addEventListener('click', async () => {
       scene.videoPrompt = el.querySelector('.scene-prompt').value;
       await generateOneScene(scene, el, true);
-    });
-
-    const extBtn = el.querySelector('.act-extend');
-    if (extBtn) extBtn.addEventListener('click', async () => {
-      await extendFromScene(scene, el);
     });
 
     el.querySelector('.act-delete').addEventListener('click', () => {
@@ -486,61 +458,31 @@ $('#btnAddScene').addEventListener('click', () => {
 });
 
 /* =====================================================================
- * IMAGE KEYFRAME
- * ===================================================================== */
-async function generateSceneImage(scene, el) {
-  if (!state.apiKey) { toast('Set API key first', true); return; }
-  const prompt = scene.videoPrompt || $('#videoStyle').value.trim();
-  if (!prompt) { toast('Write a video prompt first', true); return; }
-  const btn = el.querySelector('.act-image');
-  btn.disabled = true; btn.textContent = '⏳';
-  const sc = sceneScope(scene);
-  try {
-    log.info(sc, 'Generating keyframe image...');
-    const url = await generateImage(prompt + (state.settings.videoStyle ? ', style: ' + state.settings.videoStyle : ''), scene.ratio || '16:9');
-    scene.keyframeImage = url;
-    saveState();
-    log.success(sc, 'Keyframe image ready: ' + url);
-    toast('Keyframe image generated ✓ (used as image-to-video base)');
-  } catch (e) {
-    log.error(sc, 'Keyframe image failed', e.message);
-    toast('Keyframe failed: ' + e.message, true);
-  } finally {
-    btn.disabled = false; btn.textContent = '🖼 Keyframe image';
-  }
-}
-
-/* =====================================================================
  * VIDEO GENERATION
  * ===================================================================== */
 async function generateOneScene(scene, el, fresh) {
   if (!state.apiKey) { toast('Set API key first', true); return; }
   if (!scene.videoPrompt.trim()) { toast('Scene prompt is empty', true); return; }
 
-  // if a previous completed scene exists and this is not fresh, try extending from its last frame
-  let imageUrl = scene.keyframeImage || null;
   const sc = sceneScope(scene);
 
-  if (imageUrl) {
-    log.info(sc, 'Using saved keyframe image as starting frame');
-  } else {
-    const prev = prevCompletedScene(scene);
-    if (prev && prev.videoUrl) {
-      setSceneStatus(scene, el, 'extending', 2);
-      log.info(sc, 'Extending from previous scene last frame...');
-      try {
-        const frame = await extractLastFrame(prev.videoUrl, sc);
-        log.success(sc, 'Last frame extracted (used as ti2vid start frame)');
-        imageUrl = frame;
-        scene.extendFrom = prev.videoUrl;
-      } catch (e) {
-        log.warn(sc, 'Extend failed — falling back to text-to-video', e.message);
-        toast('Extend from last frame failed, using text-to-video instead: ' + e.message, true);
-        imageUrl = null;
-      }
-    } else {
-      log.info(sc, 'No previous scene — generating from text prompt');
+  // scene 1 (no previous completed scene) → text-to-video;
+  // later scenes → start from the previous scene's last frame (ti2vid continuity)
+  let imageUrl = null;
+  const prev = prevCompletedScene(scene);
+  if (prev && prev.videoUrl) {
+    setSceneStatus(scene, el, 'extending', 2);
+    log.info(sc, 'Extending from previous scene last frame...');
+    try {
+      imageUrl = await extractLastFrame(prev.videoUrl, sc);
+      log.success(sc, 'Last frame extracted (used as ti2vid start frame)');
+    } catch (e) {
+      log.warn(sc, 'Extend failed — falling back to text-to-video', e.message);
+      toast('Extend from last frame failed, using text-to-video instead: ' + e.message, true);
+      imageUrl = null;
     }
+  } else {
+    log.info(sc, 'No previous scene — generating from text prompt (text-to-video)');
   }
 
   const params = {
@@ -659,26 +601,6 @@ function pollUntilDone(scene, el) {
   });
 }
 
-async function extendFromScene(scene, el) {
-  if (!scene.videoUrl) { toast('This scene has no video yet', true); return; }
-  if (!state.apiKey) { toast('Set API key first', true); return; }
-  const dur = parseInt($('#sceneDuration').value, 10) || 5;
-  const ratio = $('#aspectRatio').value;
-  const newScene = {
-    id: uid(), videoPrompt: 'Continue the previous scene seamlessly: ' + (scene.videoPrompt || ''),
-    narrationBn: '', status: 'pending', progress: 0, videoUrl: '', error: '',
-    seconds: dur, width: RATIO_SIZES[ratio].width, height: RATIO_SIZES[ratio].height,
-    numFrames: DURATION_FRAMES[dur], frameRate: FRAME_RATE, ratio,
-  };
-  const idx = state.scenes.findIndex(s => s.id === scene.id);
-  state.scenes.splice(idx + 1, 0, newScene);
-  saveState(); renderScenes(); renderVoiceover();
-
-  // auto-generate the new scene (extends from the previous video's last frame)
-  const newEl = $(`.scene[data-id="${newScene.id}"]`);
-  await generateOneScene(newScene, newEl, false);
-}
-
 /* =====================================================================
  * GENERATE ALL
  * ===================================================================== */
@@ -745,7 +667,7 @@ $('#btnGenerateAll').addEventListener('click', async () => {
 function sceneIndex(scene) { return state.scenes.findIndex(s => s.id === scene.id); }
 
 $('#btnClearAll').addEventListener('click', () => {
-  state.scenes = state.scenes.map(s => ({ ...s, status: 'pending', progress: 0, videoUrl: '', videoId: '', error: '', keyframeImage: undefined, extendFrom: undefined }));
+  state.scenes = state.scenes.map(s => ({ ...s, status: 'pending', progress: 0, videoUrl: '', videoId: '', error: '' }));
   saveState(); renderScenes(); renderVoiceover(); updatePlayer();
   $('#fullPlayer').pause();
   $('#fullPlayer').removeAttribute('src');
