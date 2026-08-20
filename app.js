@@ -9,7 +9,7 @@ const API_BASE = 'https://apihub.agnes-ai.com';
 const VIDEO_MODEL = 'agnes-video-v2.0';
 const CHAT_MODEL = 'agnes-2.5-flash';
 const STORE_KEY = 'agnesVideoStudio_v1';
-const APP_VERSION = '20260816j';
+const APP_VERSION = '20260816k';
 
 /* Global error guard: never let an uncaught error kill the page silently.
  * Shows a dismissible overlay with the exact message so cache issues are visible. */
@@ -69,8 +69,8 @@ const VIDEO_RPM_OPTIONS = { 1: 62000, 2: 32000, 5: 15000, 10: 9000 };
 const POLL_INTERVAL = 60000;          // status query interval (reference: 60s)
 const MAX_POLL_TIME = 1800000;        // 30 min max per scene
 const MAX_CONSECUTIVE_FAILURES = 10;  // give up after N consecutive poll failures
-const MAX_SUBMIT_RETRIES = 5;         // submit retries with linear backoff
-const RETRY_BASE_DELAY = 30000;       // delay = 30s * (attempt+1)
+const MAX_SUBMIT_RETRIES = 8;         // submit retries with linear backoff (capped)
+const RETRY_BASE_DELAY = 30000;       // delay = min(30s * (attempt+1), 150s)
 const MIN_INTERVALS = {
   video: () => VIDEO_RPM_OPTIONS[state.settings.videoRpm || 1] || 62000,
   image: () => 3200,   // image ~20 rpm → 3.2s spacing
@@ -248,8 +248,8 @@ function isRetryableError(err) {
   return false;
 }
 
-/* Submit one video task with linear-backoff retries.
- * delay = RETRY_BASE_DELAY * (attempt+1): 30s, 60s, 90s, 120s, 150s (max 5 attempts).
+/* Submit one video task with capped linear-backoff retries.
+ * delay = min(30s * (attempt+1), 150s): 30s, 60s, 90s, 120s, 150s, 150s… (max 8 attempts).
  */
 async function createVideoTask(params, scope) {
   let lastErr;
@@ -267,7 +267,7 @@ async function createVideoTask(params, scope) {
       lastErr = err;
       if (scope) log.warn(scope, 'Submit attempt ' + (attempt + 1) + ' failed', err.message);
       if (!isRetryableError(err) || attempt === MAX_SUBMIT_RETRIES - 1) throw err;
-      const delay = RETRY_BASE_DELAY * (attempt + 1);
+      const delay = Math.min(RETRY_BASE_DELAY * (attempt + 1), 150000);
       const secs = Math.round(delay / 1000);
       if (scope) log.info(scope, 'Retrying submit in ' + secs + 's (backoff)');
       if (onRateWait) onRateWait(secs, 'video', true);
